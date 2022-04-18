@@ -1,0 +1,141 @@
+
+
+
+1. Core is rejecting messages based on the current validator set, which is the
+validators defined by the current height. If we assume that in an epoch all
+validators rotate and none of them do so simultaneously, but instead that first
+one validator changes receives the new block and realises they have been
+elected and then a second and so on. The first validator will send its
+consensus messages to all the validators that it sees, but none of those nodes
+will know that they are validators yet and will discard the messages. The next
+validator's message will only reach the first validators message and so on.
+Averaging out over the whole set of validators we see that each validator will
+receive messages from 1/2 of the other validators. This is not enogh to commit
+to a value and so there will be a round change. This is an extreme case but it
+highlights problems with this approach.
+
+2. The check of
+
+	// We will never do consensus on any round less than desiredRound.
+	if c.current.Round().Cmp(c.current.DesiredRound()) > 0 {
+		panic(fmt.Errorf("Current and desired round mismatch! cur=%v des=%v", c.current.Round(), c.current.DesiredRound()))
+	}
+
+Seems redundant becasue that should never be able to happen, if its a sanity
+check then this seems to be the wrong place for it. It should instead be
+executed after changing the current or desiered round. Checking it for each
+message is a waste.
+
+3. There is significant processing dedicated to outputting a warning that I do not understand.
+
+	preprepare := msg.Preprepare()
+	// Git validator set for the given proposal
+	valSet := c.backend.ParentBlockValidators(preprepare.Proposal)
+	prevBlockAuthor := c.backend.AuthorForBlock(preprepare.Proposal.Number().Uint64() - 1)
+	proposer := c.selectProposer(valSet, prevBlockAuthor, preprepare.View.Round.Uint64())
+
+	// We no longer broadcast a COMMIT if this is a PREPREPARE from the correct proposer for an existing block.
+	// However, we log a WARN for potential future debugging value.
+	if proposer.Address() == msg.Address && c.backend.HasBlock(preprepare.Proposal.Hash(), preprepare.Proposal.Number()) {
+		logger.Warn("Would have sent a commit message for an old block")
+		return nil
+	}
+
+The message says would have send a commit for an old block, its not clear what
+that means because we don't send commits for old blocks.
+
+4. We perform the following check when adding a future message to the backlog.
+
+	// Store in backlog (if it's not from self)
+	if msg.Address != c.address {
+		c.backlog.store(msg)
+	}
+
+It seems like an impossible situation to be in. I don't think we ever decrement
+round or sequence, so this shouldn't be needed.
+
+5. Backend.Validators and Backend.ParentBlockValidators are being used in
+several places where the randomness added to the set is not required, thus
+resulting in many unnecessary contract calls to get the randomness. This
+happens when handling commit messages and preprepare messages. So potentially
+hundreds of times per block.
+
+6. Multiple proposals, how is that handled? I think first one wins.
+
+7. Rather than having createRoundState and newRoundState which both return
+RoundState objects it might be nicer to just load state directly in core.Start
+and use that to create a new round state.
+
+8. istanbul.StartValidating returns an error that is not checked.
+
+miner/worker.go:206
+			istanbul.StartValidating()
+
+9. In order to split ot round change cert verification from core we need to separate the following functions from core
+validateFn
+verifyPreparedCertificate
+  validateFn
+  backend.NextBlockValidators - maybe we can just use the current validtor set here.
+  verifyCommittedSeal
+  verifyEpochValidatorSetSeal
+
+10. What if we receive round changes that cause us to round change to round 5 but then receive a preprepare for a lower round.
+This can't happen because we would not process a lower veiw message, so the proposer has to catch up in this setting.
+
+11. Can nodes agree blocks at different rounds, it seems the answer is yes. In
+the scenario that all nodes send commits but only one node receives all the
+commits. That node will commit, the remaining nodes will round change.
+
+So if half the network commits, then the other half gets stuck? Except that we
+have the block synchronisation protocol, but we shouldn't be relying on that.
+
+11. So in the case that one validator commits in round 0 but the others move to round 1, that single validaotr will round change meaning that when the other validators come to agree the block then there will be a huge wait for them to catch up.
+12. When half the network progresses in this way, the remaini
+
+What if a commit is a fake commit?
+
+13. When processing round change cert and round changes are different, with the
+round change cert, nodes only switch to the round of the proposal. Even if
+there is a quorum of round changes for a much higher round. If they were to
+process those round changes normally they would switch to that round and then
+not be able to accept the proposal.
+
+So what if I receive a proposal from a node with a round change cert with
+higher number round changes. I accept and start working on it but if I then
+receive some of the higher round changes I will switch rounds and not be able to
+continue on that proposal.
+
+So to clarify, if I receive a round change cert with enough round changes of
+higher rounds such that I now have 3f+1 round changes for a higher round there
+is no point preparing the proposal, since it can never be confirmed.
+
+So these 2 streams of processing should be streamlined.
+
+14. Thoughts on round changes. Its ok to have a prepared cert that is much older
+than the proposal, it is still a prepared cert and it could be the only one.
+Since if nodes send no messages and timeout with round changes for a new round
+then there is no new prepared cert to have.
+
+15. Had a horrible time debugging an issue where I had set the value of the
+current round in a test to 2. The problem was that in core when starting a new
+sequence we set the Round to common.Big0, subsequently setting the Round to 2
+changed the value of Big0 to 2. We need to be really careful when using big
+ints of this kind of problem, and we should probably avoid use of common.BigX
+for this reason.
+
+consensus/istanbul/core/core.go:528
+		Round:    new(big.Int).Set(common.Big0),
+
+16. We are not running the benchmarks, we probably should do that in CI
+
+17. startNewRound to take uint64
+
+18. perfectly healthy validators can have "downtime" even when they sign
+blocks. This is because blocks can be finalised with different rounds.
+
+So imagine that all nodes commit for block x at round 1 but only 1/3 of
+validators receive those commits and commit the block. The rest of the network
+progreses to round 2 and commits block x in round 2. If the next proposer
+committed the block in round 2, then validators that committed in round 1 will
+not have their signatures counted, it will look like they were down, when in
+fact they did a better job than the remaining 2/3 validators. 
