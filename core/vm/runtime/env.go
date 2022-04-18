@@ -1,0 +1,50 @@
+// Copyright 2015 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+
+package runtime
+
+import (
+	"math/big"
+
+	"github.com/celo-org/celo-blockchain/common"
+	"github.com/celo-org/celo-blockchain/core/vm"
+)
+
+func NewEnv(cfg *Config) *vm.EVM {
+
+	context := vm.Context{
+		CanTransfer: vm.CanTransfer,
+
+		GetHash: cfg.GetHashFn,
+
+		Origin:      cfg.Origin,
+		Coinbase:    cfg.Coinbase,
+		BlockNumber: cfg.BlockNumber,
+		Time:        cfg.Time,
+		GasPrice:    cfg.GasPrice,
+
+		Transfer: func(e *vm.EVM, sender, recipient common.Address, amount *big.Int) {
+			vm.Transfer(e.StateDB, sender, recipient, amount)
+		},
+		GetAddressFromRegistry: cfg.GetAddressFromRegistry,
+	}
+
+	if cfg.ChainConfig.Istanbul != nil {
+		context.EpochSize = cfg.ChainConfig.Istanbul.Epoch
+	}
+
+	return vm.NewEVM(context, cfg.State, cfg.ChainConfig, cfg.EVMConfig)
+}
