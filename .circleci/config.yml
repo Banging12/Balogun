@@ -1,0 +1,322 @@
+version: 2.1
+executors:
+  golang:
+    docker:
+      - image: circleci/golang:1.13
+    working_directory: ~/repos/geth
+  e2e:
+    docker:
+      - image: celohq/node10-gcloud
+    working_directory: ~/repos/celo-monorepo/packages/celotool
+    environment:
+      GO_VERSION: "1.13.7"
+      CELO_MONOREPO_BRANCH_TO_TEST: master
+jobs:
+  build-bls-zexe:
+    docker:
+      - image: circleci/rust:1.41.0
+    working_directory: ~/repos/geth
+    steps:
+      - checkout
+      - run:
+          name: Setup Rust language
+          command: |
+            rustup install 1.41.0
+            rustup default 1.41.0
+      - run:
+          name: Compile bls-zexe
+          command: |
+            export PATH=$PATH:$HOME/.cargo/bin
+            make bls-zexe
+
+      - persist_to_workspace:
+          root: ~/repos
+          paths:
+            - geth
+  build-geth:
+    executor: golang
+    steps:
+      - attach_workspace:
+          at: ~/repos
+      - restore_cache:
+          keys:
+            - go-mod-v1-{{ checksum "go.sum" }}
+      - run:
+          name: Build Geth
+          command: go run build/ci.go install
+      - save_cache:
+          key: go-mod-v1-{{ checksum "go.sum" }}
+          paths:
+            - "/go/pkg/mod"
+      - persist_to_workspace:
+          root: ~/repos
+          paths:
+            - geth
+  unit-tests:
+    executor: golang
+    steps:
+      - attach_workspace:
+          at: ~/repos 
+      - restore_cache:
+          keys:
+            - go-mod-v1-{{ checksum "go.sum" }}          
+      - run: go get github.com/jstemmer/go-junit-report
+      - run: 
+          name: Run Tests
+          command: |
+            mkdir -p /tmp/test-results
+            trap "go-junit-report < /tmp/test-results/go-test.out > /tmp/test-results/go-test-report.xml" EXIT
+            go run build/ci.go test -v | tee /tmp/test-results/go-test.out
+      - store_artifacts:
+          path: /tmp/test-results
+          destination: raw-test-output
+
+      - store_test_results:
+          path: /tmp/test-results            
+
+  coverage:
+    executor: golang
+    steps:
+      - attach_workspace:
+          at: ~/repos
+      - restore_cache:
+          keys:
+            - go-mod-v1-{{ checksum "go.sum" }}          
+      - run: go run build/ci.go test -coverage
+      - run: bash <(curl -s https://codecov.io/bash)
+
+  lint:
+    executor: golang
+    steps:
+      - attach_workspace:
+          at: ~/repos                  
+      - run: go get github.com/jstemmer/go-junit-report        
+      - run: 
+          name: Run Linter
+          command: |
+            mkdir -p /tmp/test-results
+            go run build/ci.go ensure-linter
+            ./build/cache/golangci-lint-1.23.6-linux-amd64/golangci-lint run --config .golangci.yml --out-format junit-xml ./... | tee /tmp/test-results/go-lint-report.xml
+      - store_artifacts:
+          path: /tmp/test-results
+          destination: raw-test-output
+      - store_test_results:
+          path: /tmp/test-results                
+
+  android:
+    docker:
+      - image: celohq/circleci:android-v2
+    working_directory: ~/repos/geth
+    steps:
+      - checkout
+      - run:
+          name: Compile android client
+          command: make android
+      - persist_to_workspace:
+          root: ~/repos
+          paths:
+            - geth/build/bin/geth.aar
+
+  ios:
+    macos:
+      xcode: "11.3.1"
+    working_directory: ~/repos/geth
+    steps:
+      - checkout
+      - run:
+          name: Setup Go language
+          command: |
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install go
+            # Check that homebrew installed the expected go version
+            if [[ "$(go version)" != "go version go1.13"* ]]; then 
+              echo "go1.13 is required"
+              exit 1
+            fi
+      - run:
+          name: Setup Rust language
+          command: curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain 1.41.0
+      - run:
+          name: Compile ios client
+          command: make ios
+      - persist_to_workspace:
+          root: ~/repos
+          paths:
+            - geth/build/bin/Geth.framework.tgz
+            - geth/vendor/github.com/celo-org/bls-zexe/target/universal/release/libepoch_snark.a
+
+  publish-mobile-client:
+    docker:
+      - image: circleci/node:10
+    working_directory: ~/repos/geth
+    steps:
+      - attach_workspace:
+          at: ~/repos
+      - run: ./scripts/publish-mobile-client.sh ${CIRCLE_SHA1} ${NPM_TOKEN_FOR_CELO_CLIENT}
+
+  checkout-monorepo:
+    executor: e2e
+    working_directory: ~/repos
+    steps:
+      - run:
+          name: Setup celo-monorepo
+          command: |
+            git clone --depth 1 https://github.com/celo-org/celo-monorepo.git celo-monorepo -b ${CELO_MONOREPO_BRANCH_TO_TEST}
+            cd celo-monorepo
+            yarn install || yarn install
+            # separate build to avoid ENOMEM in CI :(
+            yarn build --scope @celo/utils
+            yarn build --scope @celo/protocol
+            yarn build --scope docs
+            yarn build --scope @celo/walletkit
+            yarn build --ignore @celo/protocol --ignore docs --ignore @celo/walletkit --ignore @celo/web --ignore @celo/mobile --ignore @celo/react-components
+      - run:
+          name: Setup Go language
+          command: |
+            mkdir -p ~/repos/golang
+            wget https://dl.google.com/go/go${GO_VERSION}.linux-amd64.tar.gz
+            tar xf go${GO_VERSION}.linux-amd64.tar.gz -C ~/repos/golang
+            ~/repos/golang/go/bin/go version
+      - persist_to_workspace:
+          root: ~/repos
+          paths:
+            - celo-monorepo
+            - golang
+
+  end-to-end-blockchain-parameters-test:
+    executor: e2e
+    resource_class: large
+    steps:
+      - attach_workspace:
+          at: ~/repos
+      - run:
+          name: End-to-end test of governable blockchain parameters
+          command: |
+            export PATH=${PATH}:~/repos/golang/go/bin
+            ./ci_test_blockchain_parameters.sh local ~/repos/geth
+
+  end-to-end-governance-test:
+    executor: e2e
+    resource_class: large
+    steps:
+      - attach_workspace:
+          at: ~/repos
+      - run:
+          name: End-to-end test of proof-of-stake
+          no_output_timeout: 15m
+          command: |
+            export PATH=${PATH}:~/repos/golang/go/bin
+            ./ci_test_governance.sh local ~/repos/geth
+
+  end-to-end-sync-test:
+    executor: e2e
+    resource_class: large
+    steps:
+      - attach_workspace:
+          at: ~/repos
+      - run:
+          name: End-to-end test of syncing
+          no_output_timeout: 15m
+          command: |
+            export PATH=${PATH}:~/repos/golang/go/bin
+            ./ci_test_sync.sh local ~/repos/geth
+
+  end-to-end-slashing-test:
+    executor: e2e
+    resource_class: large
+    steps:
+      - attach_workspace:
+          at: ~/repos
+      - run:
+          name: End-to-end test of slashing
+          no_output_timeout: 15m
+          command: |
+            export PATH=${PATH}:~/repos/golang/go/bin
+            ./ci_test_slashing.sh local ~/repos/geth
+
+  end-to-end-transfer-test:
+    executor: e2e
+    resource_class: large
+    steps:
+      - attach_workspace:
+          at: ~/repos
+      - run:
+          name: End-to-end test of transfers
+          no_output_timeout: 15m
+          command: |
+            export PATH=${PATH}:~/repos/golang/go/bin
+            ./ci_test_transfers.sh local ~/repos/geth
+
+  end-to-end-validator-order-test:
+    executor: e2e
+    resource_class: large
+    steps:
+      - attach_workspace:
+          at: ~/repos
+      - run:
+          name: End-to-end test of random validator order
+          no_output_timeout: 15m
+          command: |
+            export PATH=${PATH}:~/repos/golang/go/bin
+            ./ci_test_validator_order.sh local ~/repos/geth
+
+workflows:
+  version: 2
+  build:
+    jobs:
+      - build-bls-zexe
+      - checkout-monorepo
+      - build-geth:
+          requires:
+            - build-bls-zexe
+      - lint:
+          requires:
+            - build-geth
+      - unit-tests:
+          requires:
+            - build-geth
+      - coverage:
+          requires:
+            - build-geth
+      - android
+      - ios
+      - publish-mobile-client:
+          requires:
+            - android
+            - ios
+            # Makes sure tests are all green before publishing
+            # Though these are not using the mobile built binaries
+            # they should be a good indicator
+            - unit-tests
+            - end-to-end-blockchain-parameters-test
+            - end-to-end-governance-test
+            - end-to-end-slashing-test
+            - end-to-end-sync-test
+            - end-to-end-transfer-test
+            - end-to-end-validator-order-test
+          filters:
+            branches:
+              only: master
+      - end-to-end-blockchain-parameters-test:
+          requires:
+            - checkout-monorepo
+            - build-geth
+      - end-to-end-governance-test:
+          requires:
+            - checkout-monorepo
+            - build-geth
+      - end-to-end-slashing-test:
+          requires:
+            - checkout-monorepo
+            - build-geth
+      - end-to-end-sync-test:
+          requires:
+            - checkout-monorepo
+            - build-geth
+      - end-to-end-transfer-test:
+          requires:
+            - checkout-monorepo
+            - build-geth
+      - end-to-end-validator-order-test:
+          requires:
+            - checkout-monorepo
+            - build-geth
