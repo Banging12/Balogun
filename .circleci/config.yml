@@ -1,0 +1,366 @@
+version: 2.1
+parameters:
+  # Use this git tag or commit of the monorepo to build the system contracts. 
+  system-contracts-monorepo-version:
+    type: string
+    default: "celo-core-contracts-v3.rc0"
+  system-contracts-path:
+    type: string
+    default: "geth/monorepo/packages/protocol/build"
+executors:
+  golang:
+    docker:
+      - image: circleci/golang:1.16
+    working_directory: ~/repos/geth
+  node-v10:
+    docker:
+      - image: celohq/node10-gcloud:v3
+    working_directory: ~/repos/geth
+  e2e:
+    docker:
+      - image: celohq/node10-gcloud:v3
+    working_directory: ~/repos/celo-monorepo/packages/celotool
+    environment:
+      GO_VERSION: "1.16.2"
+      CELO_MONOREPO_BRANCH_TO_TEST: master
+      GITHUB_RSA_FINGERPRINT: SHA256:nThbg6kXUpJWGl7E1IGOCspRomTxdCARLviKw6E5SY8
+jobs:
+  build-geth:
+    executor: golang
+    resource_class: medium+
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - go-mod-v1-{{ checksum "go.sum" }}
+      - run:
+          name: Build Geth
+          command: go run build/ci.go install
+      - save_cache:
+          key: go-mod-v1-{{ checksum "go.sum" }}
+          paths:
+            - "/go/pkg/mod"
+      - persist_to_workspace:
+          root: ~/repos
+          paths:
+            - geth
+
+  prepare-system-contracts:
+    executor: node-v10
+    resource_class: medium+
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - system-contracts-cache-<<pipeline.parameters.system-contracts-monorepo-version>>
+      - attach_workspace:
+          at: ~/repos
+      - run:
+          name: prepare system contracts
+          # Runs make prepare-system-contracts and sets the MONOREPO_COMMIT to
+          # use We also need to add the fingerprint id for the github ssh key
+          # to our known hosts in order for the monorepo post install script to
+          # work. We only do this if the cache has not been restored.
+          command: |
+            set -e
+            if [ ! -d ~/repos/<<pipeline.parameters.system-contracts-path>> ]; then
+              mkdir ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts
+              make prepare-system-contracts MONOREPO_COMMIT=<<pipeline.parameters.system-contracts-monorepo-version>>
+            fi
+      - save_cache:
+          key: system-contracts-cache-<<pipeline.parameters.system-contracts-monorepo-version>>
+          paths:
+            - ~/repos/<<pipeline.parameters.system-contracts-path>>
+      - persist_to_workspace:
+          root: ~/repos
+          paths:
+            - <<pipeline.parameters.system-contracts-path>>
+
+  unit-tests:
+    executor: golang
+    resource_class: medium+
+    steps:
+      - attach_workspace:
+          at: ~/repos
+      - restore_cache:
+          keys:
+            - go-mod-v1-{{ checksum "go.sum" }}
+      - run: go get github.com/jstemmer/go-junit-report
+      - run:
+          name: Run Tests
+          command: |
+            mkdir -p /tmp/test-results
+            trap "go-junit-report < /tmp/test-results/go-test.out > /tmp/test-results/go-test-report.xml" EXIT
+            go run build/ci.go test -v | tee /tmp/test-results/go-test.out
+      - store_artifacts:
+          path: /tmp/test-results
+          destination: raw-test-output
+
+      - store_test_results:
+          path: /tmp/test-results
+
+  coverage:
+    executor: golang
+    resource_class: medium+
+    steps:
+      - attach_workspace:
+          at: ~/repos
+      - restore_cache:
+          keys:
+            - go-mod-v1-{{ checksum "go.sum" }}
+      - run: go run build/ci.go test -coverage
+      - run: bash <(curl -s https://codecov.io/bash)
+
+  lint:
+    executor: golang
+    steps:
+      - attach_workspace:
+          at: ~/repos
+      - run: go get github.com/jstemmer/go-junit-report
+      - run:
+          name: Run Linter
+          command: |
+            mkdir -p /tmp/test-results
+            go run build/ci.go ensure-linter
+            ./build/cache/golangci-lint-1.25.0-linux-amd64/golangci-lint run --config .golangci.yml --out-format junit-xml ./... | tee /tmp/test-results/go-lint-report.xml
+      - store_artifacts:
+          path: /tmp/test-results
+          destination: raw-test-output
+      - store_test_results:
+          path: /tmp/test-results
+
+  check-imports:
+    executor: golang
+    steps:
+      - checkout
+      - run:
+          name: Check imports to ensure we are using github.com/celo-org/celo-blockchain
+          command: ./scripts/check_imports.sh
+
+  android:
+    docker:
+      - image: celohq/circleci:android-v2
+    working_directory: ~/repos/geth
+    steps:
+      - checkout
+      - run:
+          name: Compile android client
+          command: make android
+      - persist_to_workspace:
+          root: ~/repos
+          paths:
+            - geth/build/bin/geth.aar
+
+  ios:
+    macos:
+      xcode: "11.3.1"
+    working_directory: ~/repos/geth
+    steps:
+      - checkout
+      - run:
+          name: Setup Go language
+          command: |
+            brew install go@1.16
+            brew link go@1.16
+            # Check that homebrew installed the expected go version
+            if [[ "$(go version)" != "go version go1.16"* ]]; then
+              echo "go1.16 is required"
+              exit 1
+            fi
+      - run:
+          name: Compile ios client
+          command: make ios
+      - persist_to_workspace:
+          root: ~/repos
+          paths:
+            - geth/build/bin/Geth.framework.tgz
+            - geth/libbls_snark_sys.a
+
+  publish-mobile-client:
+    docker:
+      - image: circleci/node:10
+    working_directory: ~/repos/geth
+    steps:
+      - attach_workspace:
+          at: ~/repos
+      - run: ./scripts/publish-mobile-client.sh ${CIRCLE_SHA1} ${NPM_TOKEN_FOR_CELO_CLIENT}
+
+  lightest-sync-test:
+    docker:
+      - image: circleci/node:10
+    working_directory: ~/repos/geth
+    steps:
+      - attach_workspace:
+          at: ~/repos
+      - run: DATADIR=/tmp/lightest_sync_test_data MODE=lightest ./scripts/sync_test.sh
+
+  checkout-monorepo:
+    executor: e2e
+    working_directory: ~/repos
+    steps:
+      - run:
+          name: Setup celo-monorepo
+          command: |
+            set -e
+            mkdir ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts
+            ssh-keygen -F github.com -l -f ~/.ssh/known_hosts | grep "github.com RSA ${GITHUB_RSA_FINGERPRINT}"
+            git clone --depth 1 https://github.com/celo-org/celo-monorepo.git celo-monorepo -b ${CELO_MONOREPO_BRANCH_TO_TEST}
+            cd celo-monorepo
+            yarn install || yarn install
+            yarn build --scope @celo/celotool --include-filtered-dependencies
+      - run:
+          name: Setup Go language
+          command: |
+            mkdir -p ~/repos/golang
+            wget https://dl.google.com/go/go${GO_VERSION}.linux-amd64.tar.gz
+            tar xf go${GO_VERSION}.linux-amd64.tar.gz -C ~/repos/golang
+            ~/repos/golang/go/bin/go version
+      - persist_to_workspace:
+          root: ~/repos
+          paths:
+            - celo-monorepo
+            - golang
+
+  end-to-end-blockchain-parameters-test:
+    executor: e2e
+    resource_class: large
+    steps:
+      - attach_workspace:
+          at: ~/repos
+      - run:
+          name: End-to-end test of governable blockchain parameters
+          command: |
+            export PATH=${PATH}:~/repos/golang/go/bin
+            ./ci_test_blockchain_parameters.sh local ~/repos/geth
+
+  end-to-end-governance-test:
+    executor: e2e
+    resource_class: xlarge
+    steps:
+      - attach_workspace:
+          at: ~/repos
+      - run:
+          name: End-to-end test of proof-of-stake
+          no_output_timeout: 15m
+          command: |
+            export PATH=${PATH}:~/repos/golang/go/bin
+            ./ci_test_governance.sh local ~/repos/geth
+
+  end-to-end-sync-test:
+    executor: e2e
+    resource_class: large
+    steps:
+      - attach_workspace:
+          at: ~/repos
+      - run:
+          name: End-to-end test of syncing
+          no_output_timeout: 15m
+          command: |
+            export PATH=${PATH}:~/repos/golang/go/bin
+            ./ci_test_sync.sh local ~/repos/geth
+
+  end-to-end-slashing-test:
+    executor: e2e
+    resource_class: large
+    steps:
+      - attach_workspace:
+          at: ~/repos
+      - run:
+          name: End-to-end test of slashing
+          no_output_timeout: 15m
+          command: |
+            export PATH=${PATH}:~/repos/golang/go/bin
+            ./ci_test_slashing.sh local ~/repos/geth
+
+  end-to-end-transfer-test:
+    executor: e2e
+    resource_class: large
+    steps:
+      - attach_workspace:
+          at: ~/repos
+      - run:
+          name: End-to-end test of transfers
+          no_output_timeout: 15m
+          command: |
+            export PATH=${PATH}:~/repos/golang/go/bin
+            ./ci_test_transfers.sh local ~/repos/geth
+
+  end-to-end-validator-order-test:
+    executor: e2e
+    resource_class: xlarge
+    steps:
+      - attach_workspace:
+          at: ~/repos
+      - run:
+          name: End-to-end test of random validator order
+          no_output_timeout: 15m
+          command: |
+            export PATH=${PATH}:~/repos/golang/go/bin
+            ./ci_test_validator_order.sh local ~/repos/geth
+
+workflows:
+  version: 2
+  build:
+    jobs:
+      - checkout-monorepo
+      - build-geth
+      - prepare-system-contracts
+      - check-imports
+      - lint:
+          requires:
+            - build-geth
+      - unit-tests:
+          requires:
+            - build-geth
+            - prepare-system-contracts
+      - coverage:
+          requires:
+            - build-geth
+            - prepare-system-contracts
+      - android
+      - ios
+      - publish-mobile-client:
+          requires:
+            - android
+            - ios
+            # Makes sure tests are all green before publishing
+            # Though these are not using the mobile built binaries
+            # they should be a good indicator
+            - unit-tests
+            - lightest-sync-test
+            - end-to-end-blockchain-parameters-test
+            - end-to-end-governance-test
+            - end-to-end-slashing-test
+            - end-to-end-sync-test
+            - end-to-end-transfer-test
+            - end-to-end-validator-order-test
+          filters:
+            branches:
+              only: master
+      - lightest-sync-test:
+          requires:
+            - build-geth
+      - end-to-end-blockchain-parameters-test:
+          requires:
+            - checkout-monorepo
+            - build-geth
+      - end-to-end-governance-test:
+          requires:
+            - checkout-monorepo
+            - build-geth
+      - end-to-end-slashing-test:
+          requires:
+            - checkout-monorepo
+            - build-geth
+      - end-to-end-sync-test:
+          requires:
+            - checkout-monorepo
+            - build-geth
+      - end-to-end-transfer-test:
+          requires:
+            - checkout-monorepo
+            - build-geth
+      - end-to-end-validator-order-test:
+          requires:
+            - checkout-monorepo
+            - build-geth
