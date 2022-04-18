@@ -1,0 +1,402 @@
+// Copyright 2017 The Celo Authors
+// This file is part of the celo library.
+//
+// The celo library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The celo library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the celo library. If not, see <http://www.gnu.org/licenses/>.
+
+package backend
+
+import (
+	"bytes"
+	"encoding/hex"
+	"fmt"
+	"io"
+	mrand "math/rand"
+	"sort"
+	"time"
+
+	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/consensus/istanbul"
+	vet "github.com/ethereum/go-ethereum/consensus/istanbul/backend/internal/enodes"
+	"github.com/ethereum/go-ethereum/p2p"
+	"github.com/ethereum/go-ethereum/p2p/enode"
+	"github.com/ethereum/go-ethereum/rlp"
+)
+
+// ===============================================================
+//
+// define the istanbul announce data and announce record structure
+
+type announceRecord struct {
+	DestAddress       common.Address
+	EncryptedEnodeURL []byte
+}
+
+func (ar *announceRecord) String() string {
+	return fmt.Sprintf("{DestAddress: %s, EncryptedEnodeURL length: %d}", ar.DestAddress.String(), len(ar.EncryptedEnodeURL))
+}
+
+type announceData struct {
+	AnnounceRecords []*announceRecord
+	EnodeURLHash    common.Hash
+	Timestamp       uint
+}
+
+func (ad *announceData) String() string {
+	return fmt.Sprintf("{Timestamp: %v, EnodeURLHash: %v, AnnounceRecords: %v}", ad.Timestamp, ad.EnodeURLHash.Hex(), ad.AnnounceRecords)
+}
+
+// ==============================================
+//
+// define the functions that needs to be provided for rlp Encoder/Decoder.
+
+// EncodeRLP serializes ar into the Ethereum RLP format.
+func (ar *announceRecord) EncodeRLP(w io.Writer) error {
+	return rlp.Encode(w, []interface{}{ar.DestAddress, ar.EncryptedEnodeURL})
+}
+
+// DecodeRLP implements rlp.Decoder, and load the ar fields from a RLP stream.
+func (ar *announceRecord) DecodeRLP(s *rlp.Stream) error {
+	var msg struct {
+		DestAddress       common.Address
+		EncryptedEnodeURL []byte
+	}
+
+	if err := s.Decode(&msg); err != nil {
+		return err
+	}
+	ar.DestAddress, ar.EncryptedEnodeURL = msg.DestAddress, msg.EncryptedEnodeURL
+	return nil
+}
+
+// EncodeRLP serializes ad into the Ethereum RLP format.
+func (ad *announceData) EncodeRLP(w io.Writer) error {
+	return rlp.Encode(w, []interface{}{ad.AnnounceRecords, ad.EnodeURLHash, ad.Timestamp})
+}
+
+// DecodeRLP implements rlp.Decoder, and load the ad fields from a RLP stream.
+func (ad *announceData) DecodeRLP(s *rlp.Stream) error {
+	var msg struct {
+		AnnounceRecords []*announceRecord
+		EnodeURLHash    common.Hash
+		Timestamp       uint
+	}
+
+	if err := s.Decode(&msg); err != nil {
+		return err
+	}
+	ad.AnnounceRecords, ad.EnodeURLHash, ad.Timestamp = msg.AnnounceRecords, msg.EnodeURLHash, msg.Timestamp
+	return nil
+}
+
+// ==============================================
+//
+// define the constant, types, and function for the sendAnnounce thread
+
+type AnnounceFrequencyState int
+
+const (
+	// In this state, send out an announce message every 1 minute until the first peer is established
+	HighFreqBeforeFirstPeerState AnnounceFrequencyState = iota
+
+	// In this state, send out an announce message every 1 minute for the first 10 announce messages after the first peer is established.
+	// This is on the assumption that when this node first establishes a peer, the p2p network that this node is in may
+	// be partitioned with the broader p2p network. We want to give that p2p network some time to connect to the broader p2p network.
+	HighFreqAfterFirstPeerState
+
+	// In this state, send out an announce message every 10 minutes
+	LowFreqState
+)
+
+const (
+	HighFreqTickerDuration = 1 * time.Minute
+	LowFreqTickerDuration  = 10 * time.Minute
+)
+
+// The sendAnnounce thread function
+func (sb *Backend) sendAnnounceMsgs() {
+	sb.announceWg.Add(1)
+	defer sb.announceWg.Done()
+
+	// Send out an announce message when this thread starts
+	go sb.sendIstAnnounce()
+
+	// Set the initial states
+	announceThreadState := HighFreqBeforeFirstPeerState
+	currentTickerDuration := HighFreqTickerDuration
+	ticker := time.NewTicker(currentTickerDuration)
+	numSentMsgsInHighFreqAfterFirstPeerState := 0
+
+	for {
+		select {
+		case <-sb.newEpochCh:
+			go sb.sendIstAnnounce()
+
+		case <-ticker.C:
+			switch announceThreadState {
+			case HighFreqBeforeFirstPeerState:
+				{
+					if len(sb.broadcaster.FindPeers(nil, p2p.AnyPurpose)) > 0 {
+						announceThreadState = HighFreqAfterFirstPeerState
+					}
+				}
+
+			case HighFreqAfterFirstPeerState:
+				{
+					if numSentMsgsInHighFreqAfterFirstPeerState >= 10 {
+						announceThreadState = LowFreqState
+					}
+					numSentMsgsInHighFreqAfterFirstPeerState += 1
+				}
+
+			case LowFreqState:
+				{
+					if currentTickerDuration != LowFreqTickerDuration {
+						// Reset the ticker
+						currentTickerDuration = LowFreqTickerDuration
+						ticker.Stop()
+						ticker = time.NewTicker(currentTickerDuration)
+					}
+				}
+			}
+
+			go sb.sendIstAnnounce()
+		case <-sb.announceQuit:
+			ticker.Stop()
+			return
+		}
+	}
+}
+
+func (sb *Backend) generateIstAnnounce() (*istanbul.Message, error) {
+	// Retrieve the registered and active validators.  The receivers for the announce message
+	regAndActiveVals, err := sb.retrieveActiveAndRegisteredValidators()
+	if err != nil {
+		return nil, err
+	}
+
+	var enodeURLHash common.Hash
+
+	// TODO - Need to encrypt using the remote validator's validator key
+	var announceRecords []*announceRecord
+	if sb.config.Proxied {
+	    proxiesForAddresses := sb.proxyHandler.GetProxiesForAddresses(regAndActiveVals)
+		if len(proxiesForAddresses) > 0 {
+			announceRecords = make([]*announceRecord, 0, len(proxiesForAddresses))
+
+			for valAddress, proxy := range proxiesForAddresses {
+		    	announceRecords = append(announceRecords, &announceRecord{DestAddress: valAddress, EncryptedEnodeURL: []byte(proxy.externalNode.String())})
+			}
+		}
+		enodeURLHash = common.BytesToHash([]byte("test"))
+	} else {
+		selfEnodeURL := sb.p2pserver.Self().String()
+		if len(regAndActiveVals) > 0 {
+		   announceRecords = make([]*announceRecord, 0, len(regAndActiveVals))
+	        for addr := range regAndActiveVals {
+		    	announceRecords = append(announceRecords, &announceRecord{DestAddress: addr, EncryptedEnodeURL: []byte(selfEnodeURL)})
+	        }
+			enodeURLHash = istanbul.RLPHash(selfEnodeURL)
+		}
+
+	}
+
+	var msg *istanbul.Message
+	if announceRecords != nil && len(announceRecords) > 0 {
+		announceData := &announceData{
+			AnnounceRecords: announceRecords,
+			EnodeURLHash:    enodeURLHash,
+			// Unix() returns a int64, but we need a uint for the golang rlp encoding implmentation. Warning: This timestamp value will be truncated in 2106.
+			Timestamp: uint(time.Now().Unix()),
+		}
+
+	   announceBytes, err := rlp.EncodeToBytes(announceData)
+		if err != nil {
+		   sb.logger.Error("Error encoding announce content in an Istanbul Validator Enode Share message", "AnnounceData", announceData.String(), "err", err)
+		   return nil, err
+		}
+
+		msg := &istanbul.Message{
+			Code:      istanbulAnnounceMsg,
+			Msg:       announceBytes,
+			Address:   sb.Address(),
+			Signature: []byte{},
+		}
+
+		sb.logger.Debug("Generated an announce message", "IstanbulMsg", msg.String(), "AnnounceMsg", announceData.String())
+	} else {
+		sb.logger.Warn("Did not generate an announce message, since no announce records were generated")
+	}
+
+	return msg, nil
+}
+
+func (sb *Backend) sendIstAnnounce() error {
+	istMsg, err := sb.generateIstAnnounce()
+	if err != nil {
+		return err
+	}
+
+	if istMsg == nil {
+		return nil
+	}
+
+	// Sign the announce message
+	if err := istMsg.Sign(sb.Sign); err != nil {
+		sb.logger.Error("Error in signing an Istanbul Announce Message", "AnnounceMsg", istMsg.String(), "err", err)
+		return err
+	}
+
+	// Convert to payload
+	payload, err := istMsg.Payload()
+	if err != nil {
+		sb.logger.Error("Error in converting Istanbul Announce Message to payload", "AnnounceMsg", istMsg.String(), "err", err)
+		return err
+	}
+
+	sb.Gossip(nil, payload, istanbulAnnounceMsg, true)
+
+	return nil
+}
+
+func (sb *Backend) handleIstAnnounce(payload []byte) error {
+	logger := sb.logger.New("func", "handleIstAnnounce")
+
+	msg := new(istanbul.Message)
+
+	// Decode message
+	err := msg.FromPayload(payload, istanbul.GetSignatureAddress)
+	if err != nil {
+		logger.Error("Error in decoding received Istanbul Announce message", "err", err, "payload", hex.EncodeToString(payload))
+		return err
+	}
+	logger.Trace("Handling an IstanbulAnnounce message", "from", msg.Address)
+
+	// If the message is originally from this node, then ignore it
+	if msg.Address == sb.Address() {
+		logger.Trace("Received an IstanbulAnnounce message originating from this node. Ignoring it.")
+		return nil
+	}
+
+	var announceData announceData
+	err = rlp.DecodeBytes(msg.Msg, &announceData)
+	if err != nil {
+		logger.Warn("Error in decoding received Istanbul Announce message content", "err", err, "IstanbulMsg", msg.String())
+		return err
+	}
+
+	logger = logger.New("msgAddress", msg.Address, "msg_timestamp", announceData.Timestamp)
+
+	if currentEntryTimestamp, err := sb.valEnodeTable.GetTimestampFromAddress(msg.Address); err == nil {
+		if announceData.Timestamp < currentEntryTimestamp {
+			logger.Trace("Received an old announce message", "currentEntryTimestamp", currentEntryTimestamp)
+			return errOldAnnounceMessage
+		}
+	} else if err != leveldb.ErrNotFound {
+		logger.Warn("Error when retrieving timestamp for entry in the ValEnodeTable", "err", err)
+	}
+
+	// If the message is not within the registered validator set, then ignore it
+	regAndActiveVals, err := sb.retrieveActiveAndRegisteredValidators()
+	if err != nil {
+		return err
+	}
+
+	if !regAndActiveVals[msg.Address] {
+		logger.Debug("Received an IstanbulAnnounce message from a non registered validator. Ignoring it.", "AnnounceMsg", msg.String(), "err", err)
+		return errUnauthorizedAnnounceMessage
+	}
+
+	var node *enode.Node
+	var destAddresses = make([]string, 0, len(announceData.AnnounceRecords))
+	var processedAddresses = make(map[common.Address]bool)
+	var msgHasDupsOrIrrelevantEntries bool = false
+	for _, announceRecord := range announceData.AnnounceRecords {
+		// Don't process duplicate entries or entries that are not in the regAndActive valset
+		if !regAndActiveVals[announceRecord.DestAddress] || processedAddresses[announceRecord.DestAddress] {
+			msgHasDupsOrIrrelevantEntries = true
+			continue
+		}
+
+		if announceRecord.DestAddress == sb.Address() {
+			// TODO: Decrypt the enodeURL using this validator's validator key after making changes to encrypt it
+			enodeUrl := string(announceRecord.EncryptedEnodeURL)
+			node, err = enode.ParseV4(enodeUrl)
+			if err != nil {
+				logger.Error("Error in parsing enodeURL", "enodeUrl", enodeUrl)
+				return err
+			}
+		}
+		destAddresses = append(destAddresses, announceRecord.DestAddress.String())
+		processedAddresses[announceRecord.DestAddress] = true
+	}
+	// Save in the valEnodeTable if mining
+	if sb.coreStarted && node != nil {
+		if err := sb.valEnodeTable.Upsert(map[common.Address]*vet.AddressEntry{msg.Address: {Node: node, Timestamp: announceData.Timestamp}}); err != nil {
+			logger.Warn("Error in upserting a valenode entry", "AnnounceData", announceData.String(), "error", err)
+			return err
+		}
+	}
+
+	if !msgHasDupsOrIrrelevantEntries {
+		if err = sb.regossipIstAnnounce(msg, payload, announceData, regAndActiveVals, destAddresses); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (sb *Backend) regossipIstAnnounce(msg *istanbul.Message, payload []byte, announceData announceData, regAndActiveVals map[common.Address]bool, destAddresses []string) error {
+	logger := sb.logger.New("func", "regossipIstAnnounce", "msgAddress", msg.Address, "msg_timestamp", announceData.Timestamp)
+	// If we gossiped this address/enodeURL within the last 60 seconds and the enodeURLHash and destAddressHash didn't change, then don't regossip
+
+	// Generate the destAddresses hash
+	sort.Strings(destAddresses)
+	destAddressesHash := istanbul.RLPHash(destAddresses)
+
+	sb.lastAnnounceGossipedMu.RLock()
+	if lastGossipTs, ok := sb.lastAnnounceGossiped[msg.Address]; ok {
+
+		if lastGossipTs.enodeURLHash == announceData.EnodeURLHash && bytes.Equal(lastGossipTs.destAddressesHash.Bytes(), destAddressesHash.Bytes()) && time.Since(lastGossipTs.timestamp) < time.Minute {
+			logger.Trace("Already regossiped the msg within the last minute, so not regossiping.", "IstanbulMsg", msg.String(), "AnnounceData", announceData.String())
+			sb.lastAnnounceGossipedMu.RUnlock()
+			return nil
+		}
+	}
+	sb.lastAnnounceGossipedMu.RUnlock()
+
+	logger.Trace("Regossiping the istanbul announce message", "IstanbulMsg", msg.String(), "AnnounceMsg", announceData.String())
+	sb.Gossip(nil, payload, istanbulAnnounceMsg, true)
+
+	sb.lastAnnounceGossipedMu.Lock()
+	defer sb.lastAnnounceGossipedMu.Unlock()
+	sb.lastAnnounceGossiped[msg.Address] = &AnnounceGossipTimestamp{enodeURLHash: announceData.EnodeURLHash, timestamp: time.Now(), destAddressesHash: destAddressesHash}
+
+	// prune non registered validator entries in the valEnodeTable, reverseValEnodeTable, and lastAnnounceGossiped tables about 5% of the times that an announce msg is handled
+	if (mrand.Int() % 100) <= 5 {
+		for remoteAddress := range sb.lastAnnounceGossiped {
+			if !regAndActiveVals[remoteAddress] {
+				logger.Trace("Deleting entry from the lastAnnounceGossiped table", "address", remoteAddress, "gossip timestamp", sb.lastAnnounceGossiped[remoteAddress])
+				delete(sb.lastAnnounceGossiped, remoteAddress)
+			}
+		}
+
+		if err := sb.valEnodeTable.PruneEntries(regAndActiveVals); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
